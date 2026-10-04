@@ -1,0 +1,9 @@
+# Runtime/database data
+data/
+data-node*/
+
+# Compiled files
+*.exe
+
+# VS Code
+.vscode/
