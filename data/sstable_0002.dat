@@ -1,0 +1,5 @@
+PUT|key1|hello
+PUT|key11|value11
+PUT|key12|value12
+PUT|testkey|hello
+DELETE|username
