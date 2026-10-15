@@ -5,20 +5,18 @@
 #include <cstring>
 #include <vector>
 #include <thread>
-#include <sstream>
+#include <chrono>
+#include <random>
 
 // ============================================================================
 // FILE: server.cpp
 // PART OF: vaultdb
 //
-// NEW IN THIS VERSION: handleClient now packs a PUT's timestamp
-// together with its value into ONE combined string ("timestamp|value")
-// before handing it to store_.put() — KVStore itself remains totally
-// unaware timestamps or replication even exist; it just stores
-// whatever string it's given, exactly as before. On GET, we split
-// that combined string back apart before replying, so the CLIENT can
-// see the timestamp and use it to pick the freshest value across
-// multiple replicas.
+// NEW IN THIS VERSION: handleClient answers Command::MEMBERS requests
+// by replying with this server's current membership view, so a Client
+// can rebuild its HashRing from it (skipping nodes gossip has marked
+// DEAD). Everything else is unchanged from the previous version,
+// including the self-heartbeat line in gossipLoop().
 // ============================================================================
 
 #ifdef _WIN32
@@ -83,8 +81,11 @@ static bool sendMessage(int socket, const std::string& message) {
     return sendAll(socket, message.data(), message.size());
 }
 
-Server::Server(uint16_t port, const std::string& dataDir)
-    : port_(port), store_(dataDir), listenSocket_(-1) {
+Server::Server(uint16_t port, const std::string& dataDir,
+               const std::string& myAddress,
+               const std::vector<std::string>& seedPeers)
+    : port_(port), store_(dataDir), listenSocket_(-1),
+      myAddress_(myAddress), running_(true) {
 
 #ifdef _WIN32
     WSADATA wsaData;
@@ -95,9 +96,22 @@ Server::Server(uint16_t port, const std::string& dataDir)
 #endif
 
     setupListenSocket();
+
+    for (const auto& peer : seedPeers) {
+        membership_.addMember(peer);
+    }
+
+    gossipThread_ = std::thread([this]() {
+        gossipLoop();
+    });
 }
 
 Server::~Server() {
+    running_ = false;
+    if (gossipThread_.joinable()) {
+        gossipThread_.join();
+    }
+
     if (listenSocket_ != -1) {
         closeSocket(listenSocket_);
     }
@@ -141,7 +155,13 @@ void Server::setupListenSocket() {
     std::cout << "[server] listening on port " << port_ << "\n";
 }
 
-// HANDLE CLIENT — updated PUT/GET logic for timestamp packing/unpacking.
+std::string Server::handleIncomingGossip(const std::string& incomingSerialized) {
+    MembershipList incoming = MembershipList::deserialize(incomingSerialized);
+    membership_.checkForFailures();
+    membership_.merge(incoming);
+    return membership_.serialize();
+}
+
 void Server::handleClient(int clientSocket) {
     std::cout << "[server] handling client...\n";
 
@@ -153,31 +173,23 @@ void Server::handleClient(int clientSocket) {
         }
 
         std::string requestLine = *messageOpt;
-        std::cout << "[server] received: " << requestLine << "\n";
-
         Request req = decodeRequest(requestLine);
 
         Response res;
         res.success = true;
 
         if (req.command == Command::PUT) {
-            // Pack timestamp + value into ONE string before storing.
-            // KVStore has NO idea this packing is happening — to it,
-            // this is just "some string", exactly like every value
-            // it has ever stored.
+            std::cout << "[server] received: " << requestLine << "\n";
             std::string combined = std::to_string(req.timestamp) + "|" + req.value;
             store_.put(req.key, combined);
             res.found = true;
 
         } else if (req.command == Command::GET) {
+            std::cout << "[server] received: " << requestLine << "\n";
             auto stored = store_.get(req.key);
             if (stored.has_value()) {
-                // Split the combined string back apart: everything
-                // before the first '|' is the timestamp, everything
-                // after is the real value.
                 std::string combined = *stored;
                 size_t sepPos = combined.find('|');
-
                 res.found = true;
                 res.timestamp = std::stoull(combined.substr(0, sepPos));
                 res.value = combined.substr(sepPos + 1);
@@ -185,25 +197,106 @@ void Server::handleClient(int clientSocket) {
                 res.found = false;
             }
 
+        } else if (req.command == Command::GOSSIP) {
+            std::cout << "[server] received GOSSIP request\n";
+            std::string ourView = handleIncomingGossip(req.value);
+            res.found = true;
+            res.value = ourView;
+
+        } else if (req.command == Command::MEMBERS) {
+            // NEW: a client is asking for our current view of the
+            // cluster. Refresh our own failure detection first, so
+            // the statuses we report are current, then reply with
+            // the serialized list. Deliberately NOT logged: clients
+            // will poll this every few seconds, and printing each
+            // one would flood the console just like gossip would.
+            membership_.checkForFailures();
+            res.found = true;
+            res.value = membership_.serialize();
+
         } else { // Command::DELETE
-            // NOTE: deletes are NOT currently timestamped. This is a
-            // known, honest simplification — a real system would
-            // timestamp deletes too (as "tombstone" writes with their
-            // own timestamp) so that a delete can correctly "win"
-            // against an older concurrent write during quorum
-            // resolution. We're keeping this simple for now.
+            std::cout << "[server] received: " << requestLine << "\n";
             store_.remove(req.key);
             res.found = true;
         }
 
         std::string responseLine = encodeResponse(res);
         if (!sendMessage(clientSocket, responseLine)) {
-            std::cout << "[server] failed to send response, client likely disconnected.\n";
+            std::cout << "[server] failed to send response.\n";
             break;
         }
     }
 
     closeSocket(clientSocket);
+}
+
+void Server::gossipLoop() {
+    std::random_device rd;
+    std::mt19937 rng(rd());
+
+    while (running_) {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        if (!running_) break;
+
+        membership_.checkForFailures();
+
+        // Directly assert our own liveness every round (a node can
+        // never gossip with itself, so its own entry would otherwise
+        // go stale).
+        membership_.recordHeartbeat(myAddress_);
+
+        auto alive = membership_.getAliveMembers();
+        std::cout << "[server:" << port_ << "] alive peers: ";
+        for (auto& a : alive) std::cout << a << " ";
+        std::cout << std::endl;
+
+        auto allMembers = membership_.getAllMembers();
+        if (allMembers.empty()) {
+            continue;
+        }
+
+        std::uniform_int_distribution<size_t> dist(0, allMembers.size() - 1);
+        std::string targetAddress = allMembers[dist(rng)].address;
+
+        size_t colonPos = targetAddress.find(':');
+        if (colonPos == std::string::npos) continue;
+        std::string host = targetAddress.substr(0, colonPos);
+        uint16_t targetPort = static_cast<uint16_t>(
+            std::stoi(targetAddress.substr(colonPos + 1))
+        );
+
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) continue;
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(targetPort);
+        inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
+
+        if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+            closeSocket(sock);
+            continue;
+        }
+
+        Request req;
+        req.command = Command::GOSSIP;
+        req.value = membership_.serialize();
+
+        std::string encoded = encodeRequest(req);
+        if (sendMessage(sock, encoded)) {
+            auto responseOpt = readMessage(sock);
+            if (responseOpt.has_value()) {
+                Response res = decodeResponse(*responseOpt);
+                if (res.success && res.found) {
+                    MembershipList theirView = MembershipList::deserialize(res.value);
+                    membership_.merge(theirView);
+                    membership_.recordHeartbeat(targetAddress);
+                }
+            }
+        }
+
+        closeSocket(sock);
+    }
 }
 
 void Server::run() {

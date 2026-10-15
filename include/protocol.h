@@ -6,21 +6,21 @@
 // FILE: protocol.h
 // PART OF: vaultdb
 //
-// NEW IN THIS VERSION: Command::GOSSIP
-// A new request type servers send to EACH OTHER (not something a
-// normal client ever sends) to exchange MembershipList information.
-// For a GOSSIP request, the `value` field carries a SERIALIZED
-// MembershipList (built in membership.h/.cpp) instead of a normal
-// database value, and `key` is unused/empty. The response's `value`
-// field carries the RESPONDING server's own serialized list back —
-// so one request/response pair is a full two-way gossip exchange.
+// NEW IN THIS VERSION: Command::MEMBERS
+// A request a CLIENT sends to a server to ask "what is your current
+// view of the cluster?". Unlike GOSSIP (which is a two-way exchange
+// between servers), MEMBERS is one-way: the client sends nothing
+// useful, and the server's response `value` carries its serialized
+// MembershipList. The client uses this to rebuild its HashRing so
+// routing skips nodes that gossip has marked DEAD.
 // ============================================================================
 
 enum class Command {
     PUT,
     GET,
     DELETE,
-    GOSSIP
+    GOSSIP,
+    MEMBERS
 };
 
 struct Request {

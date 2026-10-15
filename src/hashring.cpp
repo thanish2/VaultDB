@@ -49,7 +49,7 @@ uint32_t HashRing::hashString(const std::string& input) const {
     hash ^= (hash >> 13);
     hash *= 0xc2b2ae35;
     hash ^= (hash >> 16);
-
+    
     return hash;
 }
 

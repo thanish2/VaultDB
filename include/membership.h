@@ -3,6 +3,8 @@
 #include <map>
 #include <vector>
 #include <chrono>
+#include <mutex>
+#include <cstdint>
 
 // ============================================================================
 // FILE: membership.h
@@ -12,26 +14,28 @@
 // This defines the data structure gossip actually operates on: each
 // node's local, ever-evolving VIEW of who else is in the cluster, and
 // whether each of them currently looks alive or not. No networking
-// code lives here at all — this file is pure, testable bookkeeping
-// logic, same philosophy as protocol.h before any sockets existed.
+// code lives here at all.
 //
-// THE CORE IDEA:
-// Every node maintains a MembershipList — its own local belief about
-// the cluster. Nodes periodically exchange (gossip) their lists with
-// each other (built in a later file, gossip.h/.cpp), and MERGE what
-// they receive into their own list, using "who has heard from this
-// node more recently" as the tie-breaker. Over several rounds, this
-// merging process lets accurate membership information spread across
-// the whole cluster without any central coordinator.
+// NEW IN THIS VERSION: THREAD SAFETY.
+// A single MembershipList is now touched by several threads at once:
+//   - the gossip thread (gossipLoop)
+//   - every client-handler thread (incoming GOSSIP and MEMBERS requests)
+// Without protection, two threads modifying the underlying std::map at
+// the same time is a data race (the same class of bug we fixed in
+// KVStore with a mutex). So every public method now locks mutex_.
 //
-// NEW IN THIS VERSION: serialize()/deserialize()
-// These convert a MembershipList to/from the flat text format that
-// travels inside a GOSSIP Request's `value` field:
-//   "address,status,incarnation;address,status,incarnation;..."
-// lastHeartbeat is DELIBERATELY never serialized — it's a
-// steady_clock::time_point, meaningless outside the process that
-// created it. The receiving node always resets it to ITS OWN current
-// time when adopting new information (see membership.cpp).
+// CONSEQUENCES OF HAVING A MUTEX MEMBER:
+//   1. std::mutex cannot be copied, so MembershipList cannot be copied
+//      either. Nothing in the project needs to copy one (they are only
+//      ever created in place, or returned straight from deserialize()).
+//   2. deserialize() builds a plain std::map first and hands it to a
+//      private constructor, so the finished object is returned
+//      directly with no copy or move needed (C++17 guarantees this).
+//   3. recordHeartbeat() sometimes needs to add a member. Calling the
+//      public addMember() from inside it would try to lock mutex_
+//      twice on the same thread, which deadlocks (std::mutex is not
+//      re-entrant, same lesson as flush() in KVStore). So both use a
+//      private addMemberLocked() that assumes the lock is ALREADY held.
 // ============================================================================
 
 enum class MemberStatus {
@@ -46,75 +50,69 @@ struct MemberInfo {
     MemberStatus status = MemberStatus::ALIVE;
 
     // The LOCAL time (this node's own clock) when we last had direct
-    // or gossiped-and-trusted evidence this member was alive. Using
-    // steady_clock (not system_clock) specifically because it only
-    // ever moves forward and is never affected by clock adjustments —
-    // and because we ONLY ever compare this against OUR OWN current
-    // time, never against another node's clock, clock skew between
-    // machines is simply not a concern here.
+    // or gossiped-and-trusted evidence this member was alive. We only
+    // ever compare this against OUR OWN current time, never against
+    // another node's clock, so clock skew between machines is not a
+    // concern here.
     std::chrono::steady_clock::time_point lastHeartbeat;
 
-    // A simple logical counter, incremented every time WE personally
-    // receive fresh evidence this member is alive (a direct heartbeat,
-    // or a newer piece of gossip about it). This is what lets us
-    // decide, when MERGING two members' views of the same node,
-    // "whose information is actually newer" — higher counter wins,
-    // regardless of real-world clock time. This avoids relying on
-    // wall-clock comparison ACROSS different nodes' gossip messages,
-    // which would reintroduce the clock-skew problem we just said we
-    // were avoiding.
+    // A simple logical counter used to decide, when merging two nodes'
+    // views of the same member, whose information is newer. Higher
+    // counter wins, regardless of any clock.
     uint64_t incarnation = 0;
 };
 
 class MembershipList {
 public:
-    // Adds a brand new member we didn't know about before, marked
-    // ALIVE, with a fresh heartbeat timestamp.
+    MembershipList() = default;
+
+    // Not copyable, because it owns a mutex (see header comment).
+    MembershipList(const MembershipList&) = delete;
+    MembershipList& operator=(const MembershipList&) = delete;
+
+    // Adds a brand new member, marked ALIVE, with a fresh timestamp.
     void addMember(const std::string& address);
 
-    // Called when we get DIRECT evidence a member is alive (e.g. we
-    // successfully gossiped with them, or successfully sent them a
-    // request). Resets their status to ALIVE and refreshes their
-    // heartbeat timestamp/incarnation.
+    // Direct evidence a member is alive: refreshes their timestamp,
+    // bumps their incarnation, marks them ALIVE.
     void recordHeartbeat(const std::string& address);
 
-    // Checks every known member's lastHeartbeat against the current
-    // time, and updates their status: ALIVE -> SUSPECTED if too long
-    // since last heard, SUSPECTED -> DEAD if even longer. Meant to be
-    // called periodically (e.g. once per second) by a background loop.
+    // Re-derives every member's status from OUR OWN clock:
+    // ALIVE -> SUSPECTED -> DEAD as silence gets longer.
     void checkForFailures();
 
-    // Merges ANOTHER node's membership view into our own — the actual
-    // gossip logic. For every member mentioned in "other", if we don't
-    // know about them, add them; if we do, keep whichever version has
-    // the HIGHER incarnation number (i.e. more recent evidence).
-    // NOTE: status is NEVER copied directly — only incarnation and a
-    // freshened lastHeartbeat are adopted. status is always recomputed
-    // locally by checkForFailures(), to avoid two nodes with EQUAL
-    // incarnation numbers getting permanently stuck disagreeing on
-    // status (a real issue found and fixed during development).
+    // Merges ANOTHER node's view into ours (the gossip logic). Only
+    // incarnation is compared; status is never copied, it is always
+    // recomputed locally by checkForFailures().
     void merge(const MembershipList& other);
 
-    // Returns just the addresses currently believed to be ALIVE —
-    // this is what HashRing will be rebuilt from.
+    // Addresses currently believed ALIVE.
     std::vector<std::string> getAliveMembers() const;
 
-    // Returns a copy of everything we currently know — used when WE
-    // are the one sending gossip to someone else.
+    // A copy of everything we currently know.
     std::vector<MemberInfo> getAllMembers() const;
 
-    // Turns this list into ONE flat string, suitable for sending
-    // inside a GOSSIP request's value field.
+    // Flat text form for sending inside a GOSSIP/MEMBERS message:
+    //   "address,status,incarnation;address,status,incarnation;..."
+    // lastHeartbeat is deliberately NOT included (it is meaningless
+    // outside the process that recorded it).
     std::string serialize() const;
 
-    // Parses a string in that same format back into a usable
-    // MembershipList object. Used on the RECEIVING end of a gossip
-    // exchange, to turn the incoming payload into something we can
-    // actually call merge() with.
+    // Rebuilds a MembershipList from that text form.
     static MembershipList deserialize(const std::string& data);
 
 private:
-    // Keyed by address, so looking up "do we know this member" and
-    // updating them is a simple, fast map operation.
+    // Used only by deserialize(), to construct a finished list directly.
+    explicit MembershipList(std::map<std::string, MemberInfo> members);
+
+    // Does the work of addMember() but ASSUMES mutex_ is already held
+    // by the caller. Exists so recordHeartbeat() can add a member
+    // without locking twice (which would deadlock).
+    void addMemberLocked(const std::string& address);
+
+    // "mutable" so const methods (serialize, getAllMembers, ...) can
+    // still lock it; locking changes the mutex's internal state, not
+    // the membership data itself.
+    mutable std::mutex mutex_;
     std::map<std::string, MemberInfo> members_;
 };

@@ -6,11 +6,14 @@
 // FILE: protocol.cpp
 // PART OF: vaultdb
 //
-// NEW: GOSSIP wire format is "GOSSIP|payload" — simpler than PUT/GET,
-// since gossip has no real "key", just one big payload string (the
-// serialized MembershipList). We take EVERYTHING after the first '|'
-// as the payload, rather than splitting further, since the payload
-// itself will contain its own internal separators.
+// NEW IN THIS VERSION: MEMBERS support.
+// Wire format for a MEMBERS request is just "MEMBERS|" (no payload —
+// the client is only ASKING, it has nothing to send). We keep the
+// trailing '|' on purpose: decodeRequest below requires every
+// request line to contain at least one '|' to find where the command
+// name ends, and this keeps MEMBERS consistent with every other command.
+// The server's reply reuses the normal "OK|FOUND|timestamp|value"
+// response shape, with `value` holding the serialized MembershipList.
 // ============================================================================
 
 std::string encodeRequest(const Request& req) {
@@ -22,6 +25,8 @@ std::string encodeRequest(const Request& req) {
         oss << "GET|" << req.key;
     } else if (req.command == Command::GOSSIP) {
         oss << "GOSSIP|" << req.value;
+    } else if (req.command == Command::MEMBERS) {
+        oss << "MEMBERS|";
     } else { // Command::DELETE
         oss << "DELETE|" << req.key;
     }
@@ -30,9 +35,9 @@ std::string encodeRequest(const Request& req) {
 }
 
 Request decodeRequest(const std::string& line) {
-    // Find the FIRST '|' manually, rather than using istringstream +
-    // getline, since GOSSIP's payload may itself contain characters
-    // that would confuse a generic field-by-field parse.
+    // Split on the FIRST '|' only: command name on the left, everything
+    // else on the right. GOSSIP's payload has its own internal
+    // separators, so we can't blindly split the whole line.
     size_t firstSep = line.find('|');
     if (firstSep == std::string::npos) {
         throw std::runtime_error("Malformed request: " + line);
@@ -49,7 +54,13 @@ Request decodeRequest(const std::string& line) {
         return req;
     }
 
-    // For PUT/GET/DELETE, parse normally.
+    if (cmdStr == "MEMBERS") {
+        // Nothing to parse: a MEMBERS request carries no data.
+        req.command = Command::MEMBERS;
+        return req;
+    }
+
+    // For PUT/GET/DELETE, parse the remainder field by field.
     std::istringstream iss(rest);
     std::string key, timestampStr, value;
     std::getline(iss, key, '|');

@@ -1,14 +1,25 @@
 #include "client.h"
+#include "membership.h"
 #include <iostream>
 #include <stdexcept>
 #include <vector>
 #include <chrono>
 #include <algorithm>
+#include <random>
+#include <set>
 
 // ============================================================================
 // FILE: client.cpp
 // PART OF: vaultdb
 // The actual logic behind everything declared in client.h.
+//
+// NEW IN THIS VERSION: GOSSIP-AWARE ROUTING.
+//   - refreshRingIfStale(): called at the start of put/get/remove. If
+//     more than RING_REFRESH_SECONDS have passed, it triggers a refresh.
+//   - refreshRing(): asks ONE server for its membership view (a MEMBERS
+//     request), then rebuilds ring_ from every node that is not DEAD.
+//   - dropConnection(): forgets a broken cached socket so the next
+//     request to that server reconnects instead of reusing a dead one.
 // ============================================================================
 
 #ifdef _WIN32
@@ -27,6 +38,18 @@
     #define closeSocket close
 #endif
 
+// On Linux, writing to a socket whose other end has closed raises the
+// SIGPIPE signal, which by default KILLS the whole process. We hit this
+// for real in testing: killing a server crashed any client that still
+// had an open connection to it. MSG_NOSIGNAL makes send() just return
+// an error instead, which our code already handles. Windows has no
+// SIGPIPE and doesn't define MSG_NOSIGNAL, so there it falls back to 0.
+#ifdef MSG_NOSIGNAL
+    #define SEND_FLAGS MSG_NOSIGNAL
+#else
+    #define SEND_FLAGS 0
+#endif
+
 static bool readExactly(int socket, char* buffer, int numBytes) {
     int totalReceived = 0;
     while (totalReceived < numBytes) {
@@ -41,7 +64,7 @@ static bool readExactly(int socket, char* buffer, int numBytes) {
 static bool sendAll(int socket, const char* buffer, int numBytes) {
     int totalSent = 0;
     while (totalSent < numBytes) {
-        int sent = send(socket, buffer + totalSent, numBytes - totalSent, 0);
+        int sent = send(socket, buffer + totalSent, numBytes - totalSent, SEND_FLAGS);
         if (sent <= 0) return false;
         totalSent += sent;
     }
@@ -84,11 +107,20 @@ Client::Client(const std::vector<ServerInfo>& serverList) {
     for (const auto& server : serverList) {
         std::string address = server.host + ":" + std::to_string(server.port);
         ring_.addServer(address);
+        // Remember the original addresses: they are the servers we are
+        // always allowed to ask for a membership view.
+        seedAddresses_.push_back(address);
     }
 
     if (ring_.serverCount() == 0) {
         throw std::runtime_error("Client created with an empty server list");
     }
+
+    // Pretend the last refresh happened RING_REFRESH_SECONDS ago, so
+    // the very first put/get/remove fetches a fresh view of the
+    // cluster instead of trusting the hardcoded list.
+    lastRingRefresh_ = std::chrono::steady_clock::now()
+                     - std::chrono::seconds(RING_REFRESH_SECONDS);
 }
 
 Client::~Client() {
@@ -136,11 +168,16 @@ int Client::getOrCreateConnection(const std::string& serverAddress) {
     return sock;
 }
 
+// NEW: close a cached connection and forget it, so the next request to
+// this server opens a brand new one.
+void Client::dropConnection(const std::string& serverAddress) {
+    auto it = connections_.find(serverAddress);
+    if (it == connections_.end()) return;
+    closeSocket(it->second);
+    connections_.erase(it);
+}
+
 uint64_t Client::currentTimestampMillis() const {
-    // std::chrono is C++'s standard time library. This gets "now" as
-    // a duration since a fixed reference point (the "epoch"), then
-    // converts that duration into milliseconds, then extracts the
-    // raw number out of it.
     auto now = std::chrono::system_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         now.time_since_epoch()
@@ -148,12 +185,8 @@ uint64_t Client::currentTimestampMillis() const {
     return static_cast<uint64_t>(ms.count());
 }
 
-// SEND TO ONE SPECIFIC SERVER — same logic as the old sendRequest,
-// just now taking the target explicitly instead of computing it
-// internally. If this particular server is unreachable, we catch
-// that as a FAILED response rather than letting the whole put()/get()
-// crash — a single down replica should never take down the whole
-// operation, that's the entire point of quorum.
+// CHANGED: any failure now also drops the cached connection (a failed
+// send/receive means the socket is broken, e.g. the server died).
 Response Client::sendRequestToServer(const std::string& serverAddress, const Request& req) {
     Response failure;
     failure.success = false;
@@ -164,32 +197,117 @@ Response Client::sendRequestToServer(const std::string& serverAddress, const Req
 
         std::string encoded = encodeRequest(req);
         if (!sendMessage(sock, encoded)) {
+            dropConnection(serverAddress);
             return failure;
         }
 
         auto responseOpt = readMessage(sock);
         if (!responseOpt.has_value()) {
+            dropConnection(serverAddress);
             return failure;
         }
 
         return decodeResponse(*responseOpt);
     } catch (const std::exception&) {
-        // Could not even connect to this replica — treat it exactly
-        // like any other failure, not a program-ending error.
+        dropConnection(serverAddress);
         return failure;
     }
 }
 
-// PUT — sends to ALL N replicas, requires at least W to succeed.
+// NEW: does nothing unless our view of the cluster is older than
+// RING_REFRESH_SECONDS.
+void Client::refreshRingIfStale() {
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - lastRingRefresh_
+    );
+    if (elapsed.count() >= RING_REFRESH_SECONDS) {
+        refreshRing();
+    }
+}
+
+// NEW: ask one server who is in the cluster, rebuild ring_ from the answer.
+void Client::refreshRing() {
+    // Try the seed servers in RANDOM order, so we don't always lean on
+    // the same one, and stop at the first that answers. If the first is
+    // dead, we simply move on to the next.
+    std::vector<std::string> candidates = seedAddresses_;
+    std::random_device rd;
+    std::mt19937 rng(rd());
+    std::shuffle(candidates.begin(), candidates.end(), rng);
+
+    for (const auto& address : candidates) {
+        Request req;
+        req.command = Command::MEMBERS;
+
+        Response res = sendRequestToServer(address, req);
+        if (!res.success || !res.found) {
+            continue; // this one didn't answer, try the next
+        }
+
+        MembershipList view = MembershipList::deserialize(res.value);
+
+        // Route to everyone that is NOT marked DEAD (SUSPECTED nodes
+        // stay in: suspicion can flicker for healthy nodes).
+        std::set<std::string> routable;
+        for (const auto& member : view.getAllMembers()) {
+            if (member.status != MemberStatus::DEAD) {
+                routable.insert(member.address);
+            }
+        }
+        // The server that just answered us is obviously alive, even if
+        // its own list hadn't yet recorded itself.
+        routable.insert(address);
+
+        // Rebuild the ring from scratch from the routable nodes.
+        HashRing newRing;
+        for (const auto& node : routable) {
+            newRing.addServer(node);
+        }
+        ring_ = newRing;
+
+        // Close cached connections to nodes we no longer route to.
+        // (Collect first, then drop, so we don't erase from the map
+        // while looping over it.)
+        std::vector<std::string> toDrop;
+        for (const auto& entry : connections_) {
+            if (routable.find(entry.first) == routable.end()) {
+                toDrop.push_back(entry.first);
+            }
+        }
+        for (const auto& node : toDrop) {
+            dropConnection(node);
+        }
+
+        // Print only when the routable set actually CHANGES, so you can
+        // see failure detection reach the client. "static" means this
+        // variable remembers the last printed set between calls.
+        static std::set<std::string> lastLogged;
+        if (routable != lastLogged) {
+            std::cout << "[client] cluster view updated, routing to "
+                      << routable.size() << " node(s):";
+            for (const auto& node : routable) std::cout << " " << node;
+            std::cout << std::endl;
+            lastLogged = routable;
+        }
+
+        break; // one successful answer is enough
+    }
+
+    // Record the attempt even if nobody answered, so a fully-down
+    // cluster doesn't make EVERY request retry the refresh. If nobody
+    // answered, ring_ simply stays as it was.
+    lastRingRefresh_ = std::chrono::steady_clock::now();
+}
+
 Response Client::put(const std::string& key, const std::string& value) {
+    refreshRingIfStale();
+
     std::vector<std::string> replicas = ring_.getServersForKey(key, N);
 
     Request req;
     req.command = Command::PUT;
     req.key = key;
     req.value = value;
-    // ALL replicas get the SAME timestamp for this one logical write —
-    // generated ONCE here, not separately per replica.
     req.timestamp = currentTimestampMillis();
 
     int successCount = 0;
@@ -208,8 +326,6 @@ Response Client::put(const std::string& key, const std::string& value) {
         finalResponse.success = true;
         finalResponse.found = true;
     } else {
-        // Fewer than W replicas confirmed — we cannot honestly tell
-        // the caller this write succeeded.
         finalResponse.success = false;
         finalResponse.found = false;
         std::cout << "[client] WRITE FAILED: only " << successCount
@@ -219,9 +335,9 @@ Response Client::put(const std::string& key, const std::string& value) {
     return finalResponse;
 }
 
-// GET — reads from replicas, picks the HIGHEST-timestamp answer,
-// requires at least R replicas to have responded.
 Response Client::get(const std::string& key) {
+    refreshRingIfStale();
+
     std::vector<std::string> replicas = ring_.getServersForKey(key, N);
 
     std::vector<Response> responses;
@@ -251,8 +367,6 @@ Response Client::get(const std::string& key) {
         return failure;
     }
 
-    // Among all responses that actually FOUND a value, pick the one
-    // with the highest timestamp (last-write-wins).
     Response* best = nullptr;
     for (auto& res : responses) {
         if (res.found) {
@@ -263,7 +377,6 @@ Response Client::get(const std::string& key) {
     }
 
     if (best == nullptr) {
-        // Every replica that responded said "not found."
         Response notFound;
         notFound.success = true;
         notFound.found = false;
@@ -273,10 +386,9 @@ Response Client::get(const std::string& key) {
     return *best;
 }
 
-// REMOVE — sends DELETE to all N replicas. (No timestamp comparison
-// needed here since DELETE carries no timestamp — see the earlier
-// discussion on this known simplification.)
 Response Client::remove(const std::string& key) {
+    refreshRingIfStale();
+
     std::vector<std::string> replicas = ring_.getServersForKey(key, N);
 
     Request req;

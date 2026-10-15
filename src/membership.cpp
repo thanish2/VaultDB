@@ -1,34 +1,31 @@
 #include "membership.h"
 #include <sstream>
+#include <utility>
 
 // ============================================================================
 // FILE: membership.cpp
 // PART OF: vaultdb
 // The actual logic behind everything declared in membership.h.
 //
-// CORRECTED merge() LOGIC:
-// status is NEVER copied directly from another node's gossip — only
-// incarnation and lastHeartbeat are exchanged. status is ALWAYS
-// recomputed locally by checkForFailures(), using only this node's
-// own clock. This avoids a bug found during design review: two
-// nodes with the SAME incarnation number but different status
-// (one ALIVE, one DEAD) previously had no way to resolve their
-// disagreement, since merge()'s only comparison was incarnation.
+// THRESHOLDS: SUSPECT=5s, DEAD=12s, against a 2s gossip interval.
+// Tighter values (3s/6s) caused false-positive flickering, because a
+// healthy peer can be randomly skipped for a few gossip rounds in a
+// row. The wider margin tolerates that normal randomness.
 //
-// KNOWN, ACCEPTED LIMITATION (documented, not silently hidden):
-// If two nodes already agree on a member's incarnation number but
-// disagree on status, and NEITHER currently has fresher direct
-// contact with that member to break the tie, this simplified design
-// has no mechanism to resolve the standoff. A full implementation
-// (SWIM-style "refutation") would have the member itself detect it's
-// been wrongly suspected and proactively bump its own incarnation to
-// force a correction. We are not building that here.
+// KNOWN, ACCEPTED LIMITATION: if two nodes agree on a member's
+// incarnation but disagree on its status, and neither has fresher
+// direct contact, this simplified design cannot break the tie. A full
+// SWIM-style "refutation" would fix it; we are not building that.
 // ============================================================================
 
-static constexpr int SUSPECT_TIMEOUT_SECONDS = 3;
-static constexpr int DEAD_TIMEOUT_SECONDS = 6;
+static constexpr int SUSPECT_TIMEOUT_SECONDS = 5;
+static constexpr int DEAD_TIMEOUT_SECONDS = 12;
 
-void MembershipList::addMember(const std::string& address) {
+MembershipList::MembershipList(std::map<std::string, MemberInfo> members)
+    : members_(std::move(members)) {}
+
+// Private helper: caller MUST already hold mutex_.
+void MembershipList::addMemberLocked(const std::string& address) {
     MemberInfo info;
     info.address = address;
     info.status = MemberStatus::ALIVE;
@@ -37,20 +34,32 @@ void MembershipList::addMember(const std::string& address) {
     members_[address] = info;
 }
 
+void MembershipList::addMember(const std::string& address) {
+    // lock_guard locks now and unlocks automatically when this
+    // function ends (same RAII pattern as KVStore).
+    std::lock_guard<std::mutex> guard(mutex_);
+    addMemberLocked(address);
+}
+
 void MembershipList::recordHeartbeat(const std::string& address) {
+    std::lock_guard<std::mutex> guard(mutex_);
+
     auto it = members_.find(address);
     if (it == members_.end()) {
-        addMember(address);
+        // We already hold the lock, so use the Locked helper here.
+        // Calling addMember() would lock a second time and deadlock.
+        addMemberLocked(address);
         return;
     }
-    // Direct contact: refresh OUR OWN clock, bump OUR OWN incarnation
-    // record for this peer, mark ALIVE immediately.
+
     it->second.lastHeartbeat = std::chrono::steady_clock::now();
     it->second.incarnation++;
     it->second.status = MemberStatus::ALIVE;
 }
 
 void MembershipList::checkForFailures() {
+    std::lock_guard<std::mutex> guard(mutex_);
+
     auto now = std::chrono::steady_clock::now();
     for (auto& [address, info] : members_) {
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
@@ -63,38 +72,44 @@ void MembershipList::checkForFailures() {
                 info.status = MemberStatus::SUSPECTED;
             }
         } else {
-            // Within the healthy window — correctly un-suspect if a
-            // fresher heartbeat/merge has since come in.
             info.status = MemberStatus::ALIVE;
         }
     }
 }
 
 void MembershipList::merge(const MembershipList& other) {
+    // Merging a list into itself would try to lock the same mutex
+    // twice. It would also be pointless, so just do nothing.
+    if (this == &other) return;
+
+    // scoped_lock locks BOTH mutexes together using a deadlock-
+    // avoiding algorithm, so two threads merging in opposite
+    // directions (A into B, B into A) can't block each other forever.
+    std::scoped_lock lock(mutex_, other.mutex_);
+
     for (const auto& [address, otherInfo] : other.members_) {
         auto it = members_.find(address);
 
         if (it == members_.end()) {
-            // Brand new member — adopt fully, but reset lastHeartbeat
-            // to OUR OWN clock right now, not the sender's clock.
+            // Brand new member: adopt it, but stamp it with OUR OWN
+            // clock, not the sender's.
             MemberInfo adopted = otherInfo;
             adopted.lastHeartbeat = std::chrono::steady_clock::now();
             members_[address] = adopted;
             continue;
         }
 
-        // ONLY compare incarnation. NEVER copy status directly.
+        // Only incarnation is compared. Status is never copied.
         if (otherInfo.incarnation > it->second.incarnation) {
             it->second.incarnation = otherInfo.incarnation;
             it->second.lastHeartbeat = std::chrono::steady_clock::now();
         }
-        // If incoming incarnation <= ours: ignore. Known tie-break
-        // limitation documented above applies when they're EQUAL but
-        // status disagrees.
     }
 }
 
 std::vector<std::string> MembershipList::getAliveMembers() const {
+    std::lock_guard<std::mutex> guard(mutex_);
+
     std::vector<std::string> result;
     for (const auto& [address, info] : members_) {
         if (info.status == MemberStatus::ALIVE) {
@@ -105,6 +120,8 @@ std::vector<std::string> MembershipList::getAliveMembers() const {
 }
 
 std::vector<MemberInfo> MembershipList::getAllMembers() const {
+    std::lock_guard<std::mutex> guard(mutex_);
+
     std::vector<MemberInfo> result;
     for (const auto& [address, info] : members_) {
         result.push_back(info);
@@ -112,71 +129,65 @@ std::vector<MemberInfo> MembershipList::getAllMembers() const {
     return result;
 }
 
-// Turns a MemberStatus enum into text, for serialization.
 static std::string statusToString(MemberStatus status) {
     switch (status) {
         case MemberStatus::ALIVE: return "ALIVE";
         case MemberStatus::SUSPECTED: return "SUSPECTED";
         case MemberStatus::DEAD: return "DEAD";
     }
-    return "ALIVE"; // defensive fallback, should never actually hit this
+    return "ALIVE";
 }
 
-// Turns text back into a MemberStatus enum.
 static MemberStatus statusFromString(const std::string& s) {
     if (s == "SUSPECTED") return MemberStatus::SUSPECTED;
     if (s == "DEAD") return MemberStatus::DEAD;
     return MemberStatus::ALIVE;
 }
 
-// SERIALIZE: "address,status,incarnation;address,status,incarnation;..."
 std::string MembershipList::serialize() const {
+    std::lock_guard<std::mutex> guard(mutex_);
+
     std::ostringstream oss;
     bool first = true;
-
     for (const auto& [address, info] : members_) {
-        if (!first) {
-            oss << ";"; // separate entries with ';'
-        }
+        if (!first) oss << ";";
         oss << address << "," << statusToString(info.status)
             << "," << info.incarnation;
         first = false;
     }
-
     return oss.str();
 }
 
-// DESERIALIZE: parses that format back into a real MembershipList.
 MembershipList MembershipList::deserialize(const std::string& data) {
-    MembershipList result;
+    // Build into a plain local map first. No lock is needed because
+    // nobody else can see this map yet.
+    std::map<std::string, MemberInfo> parsed;
 
-    if (data.empty()) {
-        return result; // an empty payload just means "no members"
+    if (!data.empty()) {
+        std::istringstream entryStream(data);
+        std::string entry;
+
+        while (std::getline(entryStream, entry, ';')) {
+            std::istringstream fieldStream(entry);
+            std::string address, statusStr, incarnationStr;
+
+            std::getline(fieldStream, address, ',');
+            std::getline(fieldStream, statusStr, ',');
+            std::getline(fieldStream, incarnationStr, ',');
+
+            MemberInfo info;
+            info.address = address;
+            info.status = statusFromString(statusStr);
+            info.incarnation = std::stoull(incarnationStr);
+            // Our own clock, not anything from the sender.
+            info.lastHeartbeat = std::chrono::steady_clock::now();
+
+            parsed[address] = info;
+        }
     }
 
-    // Split on ';' first, to get each individual member's chunk.
-    std::istringstream entryStream(data);
-    std::string entry;
-
-    while (std::getline(entryStream, entry, ';')) {
-        // Now split THIS entry on ',' to get its 3 fields.
-        std::istringstream fieldStream(entry);
-        std::string address, statusStr, incarnationStr;
-
-        std::getline(fieldStream, address, ',');
-        std::getline(fieldStream, statusStr, ',');
-        std::getline(fieldStream, incarnationStr, ',');
-
-        MemberInfo info;
-        info.address = address;
-        info.status = statusFromString(statusStr);
-        info.incarnation = std::stoull(incarnationStr);
-        // lastHeartbeat deliberately set to NOW — our own clock,
-        // not anything from the sender.
-        info.lastHeartbeat = std::chrono::steady_clock::now();
-
-        result.members_[address] = info;
-    }
-
-    return result;
+    // Returning a freshly constructed object directly means no copy
+    // or move is needed (guaranteed in C++17), which matters because
+    // MembershipList cannot be copied.
+    return MembershipList(std::move(parsed));
 }

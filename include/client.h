@@ -6,22 +6,34 @@
 #include <optional>
 #include <map>
 #include <vector>
+#include <chrono>
 
 // ============================================================================
 // FILE: client.h
 // PART OF: vaultdb
 //
-// NEW IN THIS VERSION: QUORUM REPLICATION.
-// N = number of replicas per key. W = write quorum (replicas that
-// must confirm a write). R = read quorum (replicas that must respond
-// to a read). We use N=3, W=2, R=2, satisfying W+R > N (2+2 > 3),
-// which guarantees any read overlaps with the most recent write.
+// QUORUM REPLICATION (unchanged): N=3 replicas per key, W=2 to confirm
+// a write, R=2 to answer a read.
 //
-// put() now sends the SAME write (with one shared timestamp) to ALL
-// N replicas, and succeeds if at least W of them confirm.
-// get() now reads from multiple replicas and returns whichever
-// response has the HIGHEST timestamp (last-write-wins), requiring at
-// least R replicas to have responded successfully.
+// NEW IN THIS VERSION: GOSSIP-AWARE ROUTING.
+// The client no longer routes using a ring frozen at startup. Every
+// few seconds it asks ONE server for that server's membership view
+// (a MEMBERS request), then rebuilds its own HashRing from every node
+// that isn't marked DEAD. So when gossip decides a node is dead, the
+// client stops routing keys to it, and when the node comes back, the
+// client starts using it again, with no recompiling and no manual
+// edits.
+//
+// WHY WE ONLY DROP "DEAD" NODES, NOT "SUSPECTED" ONES:
+// SUSPECTED can flicker on for a healthy node just from random gossip
+// timing (we saw this in testing). Dropping suspected nodes would make
+// healthy nodes briefly vanish from the ring and reroute keys for no
+// reason. DEAD takes 12 seconds of silence, which chance alone almost
+// never produces.
+//
+// THE ORIGINAL SERVER LIST IS STILL USED, but only as a BOOTSTRAP: it
+// is the list of addresses the client is allowed to ask for a
+// membership view. It no longer decides routing by itself.
 // ============================================================================
 
 struct ServerInfo {
@@ -43,18 +55,37 @@ private:
     static constexpr int W = 2; // write quorum
     static constexpr int R = 2; // read quorum
 
+    // NEW: how many seconds a view of the cluster is trusted before
+    // the client asks for a fresh one.
+    static constexpr int RING_REFRESH_SECONDS = 3;
+
     HashRing ring_;
+
+    // NEW: the original "host:port" addresses from the constructor.
+    // Kept so the client always has someone it is allowed to ask for
+    // a membership view, even after ring_ has been rebuilt.
+    std::vector<std::string> seedAddresses_;
+
+    // NEW: when ring_ was last refreshed (our own steady clock).
+    std::chrono::steady_clock::time_point lastRingRefresh_;
+
     std::map<std::string, int> connections_;
 
     int getOrCreateConnection(const std::string& serverAddress);
 
-    // CHANGED: now takes the target server EXPLICITLY, rather than
-    // figuring it out internally via the ring. put()/get() decide
-    // WHICH servers to talk to (via ring_.getServersForKey), and this
-    // function just handles talking to ONE specific one of them.
-    Response sendRequestToServer(const std::string& serverAddress, const Request& req);
+    // NEW: closes and forgets a cached connection, so the next request
+    // to that server opens a brand new one. Needed because a server
+    // that dies and later restarts leaves our old socket broken, and
+    // without this the client would keep reusing it forever.
+    void dropConnection(const std::string& serverAddress);
 
-    // Generates a timestamp representing "right now", used to tag
-    // every PUT so replicas (and later reads) can agree on ordering.
+    Response sendRequestToServer(const std::string& serverAddress, const Request& req);
     uint64_t currentTimestampMillis() const;
+
+    // NEW: called at the start of put/get/remove. Does nothing unless
+    // RING_REFRESH_SECONDS have passed since the last refresh.
+    void refreshRingIfStale();
+
+    // NEW: actually fetches a membership view and rebuilds ring_.
+    void refreshRing();
 };
